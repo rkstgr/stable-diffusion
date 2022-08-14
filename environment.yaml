@@ -8,6 +8,7 @@ dependencies:
   - cudatoolkit=11.3
   - pytorch=1.11.0
   - torchvision=0.12.0
+  - torchaudio
   - numpy=1.19.2
   - pip:
     - albumentations==0.4.3
