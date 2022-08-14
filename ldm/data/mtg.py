@@ -4,7 +4,9 @@ from typing import TypedDict, List, Dict
 import pandas as pd
 import torch
 import torchaudio
-from torch.utils.data import Dataset
+from einops import rearrange
+from mdct import mdct, imdct
+from torch.utils.data import Dataset, IterableDataset
 
 TrackId = int
 
@@ -105,3 +107,35 @@ class MTGFullAudio(MTGBase):
             waveform = waveform.mean(dim=0)
 
         return waveform
+
+
+class MTG_MDCT(IterableDataset):
+    def __init__(self, tsv_file,
+                 data_root,
+                 file_type=".opus",
+                 sampling_rate=22050,
+                 size=256
+                 ):
+        super(MTG_MDCT).__init__()
+        self.size = size
+        self.n_fft = size * 2  # for MDCT
+        self.sample_size = (size - 1) * size - 2 * size + self.n_fft
+        print(f"sample_size: {self.sample_size} ({self.sample_size * 1000 / sampling_rate:.3f}ms)")
+
+        self.mtg_base = MTGFullAudio(tsv_file, data_root, file_type, sampling_rate)
+
+    def __iter__(self):
+        def iterator():
+            for i, example in enumerate(self.mtg_base):
+                audio_repr = example["audio_repr"]
+                mdct_repr = torch.from_numpy(mdct(audio_repr, framelength=self.n_fft))
+                mdct_repr_unfolded = rearrange(mdct_repr.unfold(1, self.size, self.size), "f u t -> u f t")
+                for i, sample in enumerate(mdct_repr_unfolded):
+                    yield {
+                        **example,
+                        "audio_sample_nr": i,
+                        "audio_repr": sample,
+                    }
+
+        return iterator()
+
