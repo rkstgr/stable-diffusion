@@ -9,6 +9,7 @@ import torchaudio
 from einops import rearrange
 from mdct import mdct, imdct
 from torch.utils.data import Dataset, IterableDataset
+from tqdm import tqdm
 
 TrackId = int
 
@@ -116,7 +117,7 @@ class MTGFullAudio(MTGBase):
         return waveform
 
 
-class MtgMdct(IterableDataset):
+class MtgMdct(Dataset):
     def __init__(self,
                  split: str,
                  sampling_rate=22050,
@@ -124,38 +125,71 @@ class MtgMdct(IterableDataset):
                  ):
         super(MtgMdct).__init__()
         self.size = size
+        self.sampling_rate = sampling_rate
         self.n_fft = size * 2  # for MDCT
         self.sample_size = (size - 1) * size - 2 * size + self.n_fft
         self.sample_durationInSec = self.sample_size / sampling_rate
         print(f"sample_size: {self.sample_size} ({self.sample_size * 1000 / sampling_rate:.3f}ms)")
-
         self.mtg_base = MTGFullAudio(split=split, sampling_rate=sampling_rate)
 
-    def __len__(self) -> int:
-        """
-        Note:
-            This is only an approximation, use with caution.
-        """
-        warnings.warn(
-            "len(MtgMdct) does not return the the actual dataset length only an approximation, use with caution.")
-        total_samples = 0
-        for track_id in self.mtg_base.track_ids:
-            track_duration = self.mtg_base.tracks[track_id]["durationInSec"]
-            total_samples += track_duration // self.sample_durationInSec  # (sizedim - size) / step + 1
-        return int(total_samples)
+        self.samples = self.preprocess(self.mtg_base)
 
-    def __iter__(self):
-        def iterator():
-            for i, example in enumerate(self.mtg_base):
-                audio_repr = example["audio_repr"]
+    def get_mdct_path(self, track_id: int, sample_id: int) -> Path:
+        return Path(self.mtg_base.data_root) / "mdct" / f"{self.size}-{self.sampling_rate}Hz" / f"{track_id}" / f"{sample_id}.pt"
+
+    def save_mdct(self, track_id, sample_id, tensor):
+        mdct_path = self.get_mdct_path(track_id, sample_id)
+        mdct_path.parent.mkdir(parents=True, exist_ok=True)
+        with mdct_path.open("wb") as f:
+            torch.save(tensor, f)
+
+    def load_mdct(self, track_id, sample_id):
+        mdct_path = self.get_mdct_path(track_id, sample_id)
+        if mdct_path.exists():
+            return torch.load(mdct_path)
+        else:
+            raise FileNotFoundError(f"{mdct_path=} not found")
+
+    def mdct_samples(self, track_id) -> List[Path]:
+        track_mdct_path = self.get_mdct_path(track_id, 0).parent
+        return [p for p in track_mdct_path.glob(f"*.pt")]
+
+    def mdct_is_processed(self, track_id) -> bool:
+        track_mdct_path = self.get_mdct_path(track_id, 0).parent
+        return track_mdct_path.joinpath("processed").exists()
+
+    def mdct_mark_processed(self, track_id):
+        track_mdct_path = self.get_mdct_path(track_id, 0).parent
+        track_mdct_path.joinpath("processed").touch()
+
+    def preprocess(self, dataset: MTGBase):
+        samples = []
+        print("Preprocessing mdcts...")
+        for i, (track_id, track_info) in tqdm(enumerate(dataset.tracks.items()), total=len(dataset)):
+            if self.mdct_is_processed(track_id):
+                for sample_path in self.mdct_samples(track_id):
+                    sample = {
+                        **track_info,
+                        "sample_id": int(sample_path.stem)
+                    }
+                    samples.append(sample)
+            else:
+                audio_repr = self.mtg_base.load_audio(self.mtg_base.get_audio_path(track_id))
                 mdct_repr = torch.from_numpy(mdct(audio_repr, framelength=self.n_fft))
                 mdct_repr_unfolded = rearrange(mdct_repr.unfold(1, self.size, self.size), "f u t -> u f t")
-                for i, sample in enumerate(mdct_repr_unfolded):
-                    yield {
-                        **example,
-                        "audio_sample_nr": i,
-                        "audio_repr": sample[..., None],
+                for sample_id, sample_tensor in enumerate(mdct_repr_unfolded):
+                    self.save_mdct(track_id, sample_id, sample_tensor)
+                    sample = {
+                        **track_info,
+                        "sample_id": sample_id
                     }
+                    samples.append(sample)
+                self.mdct_mark_processed(track_id)
+        return samples
 
-        return iterator()
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, i):
+        return self.samples[i]
 
