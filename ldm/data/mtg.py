@@ -1,4 +1,5 @@
 import os
+import warnings
 from pathlib import Path
 from typing import TypedDict, List, Dict
 
@@ -125,9 +126,22 @@ class MtgMdct(IterableDataset):
         self.size = size
         self.n_fft = size * 2  # for MDCT
         self.sample_size = (size - 1) * size - 2 * size + self.n_fft
+        self.sample_durationInSec = self.sample_size / sampling_rate
         print(f"sample_size: {self.sample_size} ({self.sample_size * 1000 / sampling_rate:.3f}ms)")
 
         self.mtg_base = MTGFullAudio(split=split, sampling_rate=sampling_rate)
+
+    def __len__(self):
+        """
+        Note:
+            This is only an approximation, use with caution.
+        """
+        warnings.warn("This is only an approximation of the actual dataset length, use with caution.")
+        total_samples = 0
+        for track_id in self.mtg_base.track_ids:
+            track_duration = self.mtg_base.tracks[track_id]["durationInSec"]
+            total_samples += track_duration // self.sample_durationInSec  # (sizedim - size) / step + 1
+        return total_samples
 
     def __iter__(self):
         def iterator():
