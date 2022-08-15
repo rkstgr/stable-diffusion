@@ -131,17 +131,18 @@ class MtgMdct(IterableDataset):
 
         self.mtg_base = MTGFullAudio(split=split, sampling_rate=sampling_rate)
 
-    def __len__(self):
+    def __len__(self) -> int:
         """
         Note:
             This is only an approximation, use with caution.
         """
-        warnings.warn("This is only an approximation of the actual dataset length, use with caution.")
+        warnings.warn(
+            "len(MtgMdct) does not return the the actual dataset length only an approximation, use with caution.")
         total_samples = 0
         for track_id in self.mtg_base.track_ids:
             track_duration = self.mtg_base.tracks[track_id]["durationInSec"]
             total_samples += track_duration // self.sample_durationInSec  # (sizedim - size) / step + 1
-        return total_samples
+        return int(total_samples)
 
     def __iter__(self):
         def iterator():
