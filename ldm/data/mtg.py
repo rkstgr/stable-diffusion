@@ -1,3 +1,4 @@
+import multiprocessing
 import os
 import warnings
 from pathlib import Path
@@ -8,6 +9,7 @@ import torch
 import torchaudio
 from einops import rearrange
 from mdct import mdct, imdct
+from parallelbar import progress_map
 from torch.utils.data import Dataset, IterableDataset
 from tqdm import tqdm
 
@@ -132,10 +134,11 @@ class MtgMdct(Dataset):
         print(f"sample_size: {self.sample_size} ({self.sample_size * 1000 / sampling_rate:.3f}ms)")
         self.mtg_base = MTGFullAudio(split=split, sampling_rate=sampling_rate)
 
-        self.samples = self.preprocess(self.mtg_base)
+        self.samples = self.preprocess()
 
     def get_mdct_path(self, track_id: int, sample_id: int) -> Path:
-        return Path(self.mtg_base.data_root) / "mdct" / f"{self.size}-{self.sampling_rate}Hz" / f"{track_id}" / f"{sample_id}.pt"
+        return Path(
+            self.mtg_base.data_root) / "mdct" / f"{self.size}-{self.sampling_rate}Hz" / f"{track_id}" / f"{sample_id}.pt"
 
     def save_mdct(self, track_id, sample_id, tensor):
         mdct_path = self.get_mdct_path(track_id, sample_id)
@@ -162,30 +165,35 @@ class MtgMdct(Dataset):
         track_mdct_path = self.get_mdct_path(track_id, 0).parent
         track_mdct_path.joinpath("processed").touch()
 
-    def preprocess(self, dataset: MTGBase):
-        samples = []
+    def preprocess_track(self, track_id):
+        track_info = self.mtg_base.tracks[track_id]
+        track_samples = []
+        self.mtg_base.print_audio_metadata = False
+        if self.mdct_is_processed(track_id):
+            for sample_path in self.mdct_samples(track_id):
+                sample = {
+                    **track_info,
+                    "sample_id": int(sample_path.stem)
+                }
+                track_samples.append(sample)
+        else:
+            audio_repr = self.mtg_base.load_audio(self.mtg_base.get_audio_path(track_id))
+            mdct_repr = torch.from_numpy(mdct(audio_repr, framelength=self.n_fft))
+            mdct_repr_unfolded = rearrange(mdct_repr.unfold(1, self.size, self.size), "f u t -> u f t")
+            for sample_id, sample_tensor in enumerate(mdct_repr_unfolded):
+                self.save_mdct(track_id, sample_id, sample_tensor)
+                sample = {
+                    **track_info,
+                    "sample_id": sample_id
+                }
+                track_samples.append(sample)
+            self.mdct_mark_processed(track_id)
+        return track_samples
+
+    def preprocess(self):
         print("Preprocessing mdcts...")
-        for i, (track_id, track_info) in tqdm(enumerate(dataset.tracks.items()), total=len(dataset)):
-            if self.mdct_is_processed(track_id):
-                for sample_path in self.mdct_samples(track_id):
-                    sample = {
-                        **track_info,
-                        "sample_id": int(sample_path.stem)
-                    }
-                    samples.append(sample)
-            else:
-                audio_repr = self.mtg_base.load_audio(self.mtg_base.get_audio_path(track_id))
-                mdct_repr = torch.from_numpy(mdct(audio_repr, framelength=self.n_fft))
-                mdct_repr_unfolded = rearrange(mdct_repr.unfold(1, self.size, self.size), "f u t -> u f t")
-                for sample_id, sample_tensor in enumerate(mdct_repr_unfolded):
-                    self.save_mdct(track_id, sample_id, sample_tensor)
-                    sample = {
-                        **track_info,
-                        "sample_id": sample_id
-                    }
-                    samples.append(sample)
-                self.mdct_mark_processed(track_id)
-        return samples
+        samples = progress_map(self.preprocess_track, self.mtg_base.track_ids)
+        return [item for sublist in samples for item in sublist]
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -193,3 +201,16 @@ class MtgMdct(Dataset):
     def __getitem__(self, i):
         return self.samples[i]
 
+
+# main
+if __name__ == "__main__":
+    sampling_rate = 22050
+    size = 256
+
+    dataset = MtgMdct(split="train_0",
+                      sampling_rate=sampling_rate,
+                      size=size
+                      )
+    a1 = dataset[0]
+    print(a1["audio_repr"].shape)
+    print("DONE")
