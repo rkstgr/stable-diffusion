@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import TypedDict, List, Dict
 
@@ -41,12 +42,14 @@ class MTGBase(Dataset):
     """
 
     def __init__(self,
-                 tsv_file,
-                 data_root,
+                 split: str,
+                 tsv_file=None,
+                 data_root=None,
                  file_type=".opus",
                  sampling_rate=48000,
                  ):
-        self.data_root = data_root
+        self.data_root = data_root if data_root else Path(os.environ["MTG_DATA_ROOT"])
+        tsv_file = tsv_file if tsv_file else Path(self.data_root).joinpath(f"{split}.tsv")
         self.file_type = file_type
         self.sampling_rate = sampling_rate
 
@@ -56,12 +59,15 @@ class MTGBase(Dataset):
 
         # check that all audio tracks are present
         for track_id in self.track_ids:
-            audio_file = Path(self.data_root).joinpath(str(track_id) + file_type)
-            if not audio_file.exists():
-                raise FileNotFoundError(f"{audio_file=} not found")
+            audio_path = self.get_audio_path(track_id)
+            if not audio_path.exists():
+                raise FileNotFoundError(f"{audio_path=} not found")
 
-    def load_audio(self, audio_file) -> torch.Tensor:
+    def load_audio(self, audio_path: Path) -> torch.Tensor:
         raise NotImplementedError
+
+    def get_audio_path(self, track_id: TrackId) -> Path:
+        return Path(self.data_root) / "opus" / f"{track_id}{self.file_type}"
 
     def __len__(self):
         return len(self.track_ids)
@@ -69,9 +75,9 @@ class MTGBase(Dataset):
     def __getitem__(self, i):
         track_id = self.track_ids[i]
         track: TrackInfo = self.tracks[track_id]
-        audio_file = Path(self.data_root).joinpath(str(track_id) + self.file_type)
+        audio_path = self.get_audio_path(track_id)
 
-        audio_repr = self.load_audio(audio_file)
+        audio_repr = self.load_audio(audio_path)
         example = {
             "track_id": track_id,
             "artist_id": track["artist_id"],
@@ -90,13 +96,13 @@ class MTGFullAudio(MTGBase):
         This is a very slow operation, as it requires loading the entire audio file into memory.
     """
 
-    def load_audio(self, audio_file):
+    def load_audio(self, audio_path):
         if getattr(self, "print_audio_metadata", True):
-            metadata = torchaudio.info(audio_file)
+            metadata = torchaudio.info(audio_path)
             print(metadata)
             self.print_audio_metadata = False
 
-        waveform, sr = torchaudio.load(audio_file)
+        waveform, sr = torchaudio.load(audio_path)
 
         # resample if necessary
         if sr != self.sampling_rate:
@@ -109,20 +115,19 @@ class MTGFullAudio(MTGBase):
         return waveform
 
 
-class MTG_MDCT(IterableDataset):
-    def __init__(self, tsv_file,
-                 data_root,
-                 file_type=".opus",
+class MtgMdct(IterableDataset):
+    def __init__(self,
+                 split: str,
                  sampling_rate=22050,
                  size=256
                  ):
-        super(MTG_MDCT).__init__()
+        super(MtgMdct).__init__()
         self.size = size
         self.n_fft = size * 2  # for MDCT
         self.sample_size = (size - 1) * size - 2 * size + self.n_fft
         print(f"sample_size: {self.sample_size} ({self.sample_size * 1000 / sampling_rate:.3f}ms)")
 
-        self.mtg_base = MTGFullAudio(tsv_file, data_root, file_type, sampling_rate)
+        self.mtg_base = MTGFullAudio(split=split, sampling_rate=sampling_rate)
 
     def __iter__(self):
         def iterator():
@@ -134,7 +139,7 @@ class MTG_MDCT(IterableDataset):
                     yield {
                         **example,
                         "audio_sample_nr": i,
-                        "audio_repr": sample,
+                        "audio_repr": sample[..., None],
                     }
 
         return iterator()
