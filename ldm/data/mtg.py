@@ -1,8 +1,10 @@
+from audioop import mul
 import multiprocessing
 import os
+import time
 import warnings
 from pathlib import Path
-from typing import TypedDict, List, Dict
+from typing import Callable, TypedDict, List, Dict
 
 import pandas as pd
 import torch
@@ -49,6 +51,7 @@ class MTGBase(Dataset):
                  split: str,
                  tsv_file=None,
                  data_root=None,
+                 filter_predicate: Callable[[TrackInfo], bool] = None,
                  file_type=".opus",
                  sampling_rate=48000,
                  ):
@@ -58,6 +61,8 @@ class MTGBase(Dataset):
         self.sampling_rate = sampling_rate
 
         self.tracks: Dict[TrackId, TrackInfo] = _load_track_info(tsv_file)
+        if filter_predicate:
+            self.tracks = {k: v for k,v in self.tracks.items() if filter_predicate(v)}
         self.track_ids = list(self.tracks.keys())
         print("Loaded {} tracks from {}".format(len(self.tracks), tsv_file))
 
@@ -123,7 +128,8 @@ class MtgMdct(Dataset):
     def __init__(self,
                  split: str,
                  sampling_rate=22050,
-                 size=256
+                 size=256,
+                 **kwargs
                  ):
         super(MtgMdct).__init__()
         self.size = size
@@ -132,7 +138,7 @@ class MtgMdct(Dataset):
         self.sample_size = (size - 1) * size - 2 * size + self.n_fft
         self.sample_durationInSec = self.sample_size / sampling_rate
         print(f"sample_size: {self.sample_size} ({self.sample_size * 1000 / sampling_rate:.3f}ms)")
-        self.mtg_base = MTGFullAudio(split=split, sampling_rate=sampling_rate)
+        self.mtg_base = MTGFullAudio(split=split, sampling_rate=sampling_rate, **kwargs)
 
         self.samples = self.preprocess()
 
@@ -168,38 +174,62 @@ class MtgMdct(Dataset):
     def preprocess_track(self, track_id):
         track_info = self.mtg_base.tracks[track_id]
         track_samples = []
+        process = multiprocessing.current_process()
         self.mtg_base.print_audio_metadata = False
         if self.mdct_is_processed(track_id):
             for sample_path in self.mdct_samples(track_id):
                 sample = {
+                    "track_id": track_id,
                     **track_info,
                     "sample_id": int(sample_path.stem)
                 }
                 track_samples.append(sample)
         else:
-            audio_repr = self.mtg_base.load_audio(self.mtg_base.get_audio_path(track_id))
-            mdct_repr = torch.from_numpy(mdct(audio_repr, framelength=self.n_fft))
+            full_waveform = self.mtg_base.load_audio(self.mtg_base.get_audio_path(track_id))
+            mdct_repr = torch.from_numpy(mdct(full_waveform, framelength=self.n_fft))
             mdct_repr_unfolded = rearrange(mdct_repr.unfold(1, self.size, self.size), "f u t -> u f t")
+            last_status_time = time.time()
             for sample_id, sample_tensor in enumerate(mdct_repr_unfolded):
-                self.save_mdct(track_id, sample_id, sample_tensor)
+                self.save_mdct(track_id, sample_id, sample_tensor.clone())
                 sample = {
+                    "track_id": track_id,
                     **track_info,
                     "sample_id": sample_id
                 }
+                if (time.time() - last_status_time) > 5:
+                    print(f"[{process.name}] Processing track {track_id:>7}: {sample_id:>3}/{mdct_repr_unfolded.shape[0]:>3}")
+                    last_status_time = time.time()
                 track_samples.append(sample)
             self.mdct_mark_processed(track_id)
         return track_samples
 
     def preprocess(self):
-        print("Preprocessing mdcts...")
-        samples = progress_map(self.preprocess_track, self.mtg_base.track_ids)
-        return [item for sublist in samples for item in sublist]
+        print("Start MDCT preprocessing")
+        number_of_cores = min(int(os.environ['SLURM_CPUS_PER_TASK']), multiprocessing.cpu_count())
+        print(f"Found {number_of_cores} cpus")
+
+        samples = []
+        start = time.time()
+        last_status_time = start
+        with multiprocessing.Pool(number_of_cores) as pool:
+            for i, sample in enumerate(pool.imap_unordered(self.preprocess_track, self.mtg_base.track_ids)):
+                samples.extend(sample)
+                if (time.time() - last_status_time) > 5:
+                    print(f"MDCT preprocessing: {i}/{len(self.mtg_base.track_ids)} (ETA: {(time.time() - start) / (i + 1) * (len(self.mtg_base.track_ids) - i - 1):.1f}s)")
+                    last_status_time = time.time()
+        print(f"Finished MDCT preprocessing in {time.time() - start:.1f}s")
+        return samples
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, i):
-        return self.samples[i]
+        sample = self.samples[i]
+        mdct = self.load_mdct(sample["track_id"], sample["sample_id"])
+        return {
+            **sample,
+            "mdct": mdct
+        }
 
 
 # main
@@ -207,10 +237,11 @@ if __name__ == "__main__":
     sampling_rate = 22050
     size = 256
 
-    dataset = MtgMdct(split="train_0",
+    dataset = MtgMdct(split="train",
+                      filter_predicate=lambda t: "emocore" in t["genres"],
                       sampling_rate=sampling_rate,
                       size=size
                       )
     a1 = dataset[0]
-    print(a1["audio_repr"].shape)
+    print(a1["mdct"].shape)
     print("DONE")
