@@ -1,8 +1,7 @@
 import math
-import multiprocessing
 import os
-import time
 from pathlib import Path
+from time import time
 from typing import Callable, TypedDict, List, Dict
 
 import pandas as pd
@@ -25,11 +24,17 @@ class TrackInfo(TypedDict):
     chunk_nr: int
 
 
+class Section(TrackInfo):
+    track_id: int
+    section_nr: int
+
+
 def _load_track_info(track_file) -> Dict[TrackId, TrackInfo]:
     """
     Load tracks from tsv files and return dictionary with track_id as key and TrackInfo as value.
     """
     df = pd.read_csv(track_file, sep="\t")
+    df.drop(columns=[col for col in df.columns if "Unnamed" in col], inplace=True)
     df.genres = df.genres.apply(eval)
     df.instruments = df.instruments.apply(eval)
     df.moods = df.moods.apply(eval)
@@ -39,9 +44,13 @@ def _load_track_info(track_file) -> Dict[TrackId, TrackInfo]:
 class MTGBase(Dataset):
     """
     Args:
-        tsv_file: path to tsv file with track info
-        audio_root: path to the audio files, will search recursively for all files with file_type
-        file_type: file type of audio files, e.g. "opus" or "mp3"
+        split: "train" or "valid", determines the tsv file that will be loaded: data_root/split.tsv
+        tsv_file: specify a different tsv file than the one specified by split
+        data_root: specify a different data root than the one specified by os.environ["MTG_DATA_ROOT"]
+        filter_predicate: a function that takes a TrackInfo and returns True if the track should be included in the dataset
+        genres: a list of genres that should be included in the dataset (filter_predicate will overwrite this)
+        file_type: the file type of the audio files (e.g. ".opus")
+        sampling_rate: the sampling rate in which the audio files should be loaded
     """
 
     def __init__(self,
@@ -62,9 +71,10 @@ class MTGBase(Dataset):
         if not filter_predicate and genres:
             filter_predicate = lambda t: any([genre in t["genres"] for genre in genres])
         if filter_predicate:
-            self.tracks = {k: v for k,v in self.tracks.items() if filter_predicate(v)}
+            self.tracks = {k: v for k, v in self.tracks.items() if filter_predicate(v)}
         self.track_ids = list(self.tracks.keys())
         print("Loaded {} tracks from {}".format(len(self.tracks), tsv_file))
+        print("Total duration: {:.1f}".format(sum([t["durationInSec"] for t in self.tracks.values()])))
 
         # check that all audio tracks are present
         for track_id in self.track_ids:
@@ -77,6 +87,13 @@ class MTGBase(Dataset):
 
     def get_audio_path(self, track_id: TrackId) -> Path:
         return Path(self.data_root) / "opus" / f"{track_id}{self.file_type}"
+
+    def get_audio_length(self, track_id: TrackId) -> int:
+        metadata = torchaudio.info(self.get_audio_path(track_id))
+        frames = metadata.num_frames
+        if metadata.sample_rate != self.sampling_rate:
+            frames = math.ceil(frames * self.sampling_rate / metadata.sample_rate)
+        return int(frames)
 
     def __len__(self):
         return len(self.track_ids)
@@ -124,6 +141,26 @@ class MTGFullAudio(MTGBase):
         return waveform
 
 
+def mdct_length(audio_length, n_fft=512) -> int:
+    return int(math.ceil(audio_length / n_fft) * n_fft / (n_fft // 2) + 1)
+
+
+def aggregate_sections(dataset: MTGBase, size: int, step: int) -> List[Section]:
+    sections = []
+    last_print = time()
+    for j, (track_id, track_info) in enumerate(dataset.tracks.items()):
+        audio_length = dataset.get_audio_length(track_id)
+        audio_mdct_length = mdct_length(audio_length, n_fft=int(size * 2))
+        n_sections = int((audio_mdct_length - size) / step + 1)
+        for i in range(n_sections):
+            sections.append(Section(track_id=track_id, section_nr=i, **track_info))
+        if time() - last_print > 2:
+            print(
+                f"Aggregating sections {j}/{len(dataset.tracks)} (ETA {(time() - last_print) / j * (len(dataset.tracks) - j):.1f}s)")
+            last_print = time()
+    return sections
+
+
 class MtgMdct(Dataset):
     def __init__(self,
                  split: str,
@@ -132,111 +169,83 @@ class MtgMdct(Dataset):
                  **kwargs
                  ):
         super(MtgMdct).__init__()
+        self.split = split
         self.size = size
+        self.step = size
         self.sampling_rate = sampling_rate
-        self.n_fft = size * 2  # for MDCT
-        self.sample_size = (size - 1) * size - 2 * size + self.n_fft
-        self.sample_durationInSec = self.sample_size / sampling_rate
-        print(f"sample_size: {self.sample_size} ({self.sample_size * 1000 / sampling_rate:.3f}ms)")
         self.mtg_base = MTGFullAudio(split=split, sampling_rate=sampling_rate, **kwargs)
 
-        self.samples = self.preprocess()
+        try:
+            self.sections: List[Section] = aggregate_sections(self.mtg_base, self.size, self.step)
+        except FileNotFoundError:
+            self.save_sections(self.sections)
 
-    def get_mdct_path(self, track_id: int, sample_id: int) -> Path:
+        print(f"Loaded {len(self.sections)} sections")
+
+    def sections_path(self) -> Path:
+        return self.mtg_base.data_root / "sections" / self.split / f"{self.size}-{self.sampling_rate}.feather"
+
+    def load_sections(self) -> List[Section]:
+        path = self.sections_path()
+        if path.exists():
+            df = pd.read_feather(path)
+            return df.to_dict("records")
+        else:
+            raise FileNotFoundError(f"{path} not found")
+
+    def save_sections(self, sections):
+        path = self.sections_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df = pd.DataFrame(sections)
+        df.to_feather(path)
+
+    def get_mdct_path(self, track_id: int) -> Path:
         return Path(
-            self.mtg_base.data_root) / "mdct" / f"{self.size}-{self.sampling_rate}Hz" / f"{track_id}" / f"{sample_id}.pt"
+            self.mtg_base.data_root) / "mdct" / f"{self.size}-{self.sampling_rate}Hz" / f"{track_id}.pt"
 
-    def save_mdct(self, track_id, sample_id, tensor):
-        mdct_path = self.get_mdct_path(track_id, sample_id)
+    def save_mdct(self, track_id, tensor):
+        mdct_path = self.get_mdct_path(track_id)
         mdct_path.parent.mkdir(parents=True, exist_ok=True)
         with mdct_path.open("wb") as f:
             torch.save(tensor, f)
 
-    def load_mdct(self, track_id, sample_id):
-        mdct_path = self.get_mdct_path(track_id, sample_id)
+    def load_mdct(self, track_id, section_nr):
+        mdct_path = self.get_mdct_path(track_id)
         if mdct_path.exists():
-            return torch.load(mdct_path)
+            return torch.load(mdct_path)[section_nr].clone()
         else:
             raise FileNotFoundError(f"{mdct_path=} not found")
 
-    def mdct_samples(self, track_id) -> List[Path]:
-        track_mdct_path = self.get_mdct_path(track_id, 0).parent
-        return [p for p in track_mdct_path.glob(f"*.pt")]
-
-    def mdct_is_processed(self, track_id) -> bool:
-        track_mdct_path = self.get_mdct_path(track_id, 0).parent
-        return track_mdct_path.joinpath("processed").exists()
-
-    def mdct_mark_processed(self, track_id):
-        track_mdct_path = self.get_mdct_path(track_id, 0).parent
-        track_mdct_path.joinpath("processed").touch()
-
-    def preprocess_track(self, track_id):
-        track_info = self.mtg_base.tracks[track_id]
-        track_samples = []
-        process = multiprocessing.current_process()
-        self.mtg_base.print_audio_metadata = False
-        if self.mdct_is_processed(track_id):
-            for sample_path in self.mdct_samples(track_id):
-                sample = {
-                    "track_id": track_id,
-                    **track_info,
-                    "sample_id": int(sample_path.stem)
-                }
-                track_samples.append(sample)
-        else:
-            full_waveform = self.mtg_base.load_audio(self.mtg_base.get_audio_path(track_id))
-            mdct_repr = torch.from_numpy(mdct(full_waveform, framelength=self.n_fft))
-            mdct_repr_unfolded = rearrange(mdct_repr.unfold(1, self.size, self.size), "f u t -> u f t")
-            last_status_time = time.time()
-            for sample_id, sample_tensor in enumerate(mdct_repr_unfolded):
-                self.save_mdct(track_id, sample_id, sample_tensor.float().clone())
-                sample = {
-                    "track_id": track_id,
-                    **track_info,
-                    "sample_id": sample_id
-                }
-                if (time.time() - last_status_time) > 15:
-                    print(f"[{process.name}] Processing track {track_id:>7}: {sample_id:>3}/{mdct_repr_unfolded.shape[0]:>3}")
-                    last_status_time = time.time()
-                track_samples.append(sample)
-            self.mdct_mark_processed(track_id)
-        return track_samples
-
-    def preprocess(self):
-        print("Start MDCT preprocessing")
-        number_of_cores = min(int(os.environ['SLURM_CPUS_PER_TASK']), multiprocessing.cpu_count())
-        print(f"Found {number_of_cores} cpus")
-
-        samples = []
-        start = time.time()
-        last_status_time = start
-        try:
-            with multiprocessing.Pool(number_of_cores) as pool:
-                for i, sample in enumerate(pool.imap_unordered(self.preprocess_track, self.mtg_base.track_ids)):
-                    samples.extend(sample)
-                    if (time.time() - last_status_time) > 5:
-                        print(f"MDCT preprocessing: {i}/{len(self.mtg_base.track_ids)} (ETA: {(time.time() - start) / (i + 1) * (len(self.mtg_base.track_ids) - i - 1):.1f}s)")
-                        last_status_time = time.time()
-        finally:
-            print("Len samples", len(samples))
-        print(f"Finished MDCT preprocessing in {time.time() - start:.1f}s")
-        return samples
+    def generate_track_mdct(self, track_id):
+        """
+        Returns a list of tensor views of the mdcts for the given track_id.
+        """
+        audio = self.mtg_base.load_audio(self.mtg_base.get_audio_path(track_id))
+        audio_mdct = mdct(audio, framelength=self.size*2)
+        audio_mdct = torch.from_numpy(audio_mdct).float()
+        audio_mdcts = audio_mdct.unfold(1, self.size, self.size)
+        audio_mdcts = rearrange(audio_mdcts, "f u t -> u f t")
+        return audio_mdcts
 
     def __len__(self) -> int:
-        return len(self.samples)
+        return len(self.sections)
 
     def __getitem__(self, i):
-        sample = self.samples[i]
-        mdct = self.load_mdct(sample["track_id"], sample["sample_id"])
+        section = self.sections[i]
+        track_id = section["track_id"]
+        section_nr = section["section_nr"]
+
+        try:
+            section_mdct = self.load_mdct(track_id, section_nr)
+        except FileNotFoundError:
+            track_mdct = self.generate_track_mdct(track_id)
+            self.save_mdct(track_id, track_mdct)
+            section_mdct = track_mdct[section_nr]
+
         return {
-            **sample,
-            "mdct": mdct.float()
+            **section,
+            "mdct": section_mdct
         }
-
-
-def mdct_length(wavelength, framelength=512):
-    return math.ceil(wavelength/framelength)*framelength/(framelength//2) + 1
 
 
 # main
@@ -244,18 +253,9 @@ if __name__ == "__main__":
     sampling_rate = 22050
     size = 256
 
-    train_ds = MtgMdct(split="train",
-                      genres=None,
-                      sampling_rate=sampling_rate,
-                      size=size
-                      )
-    valid_ds = MtgMdct(split="valid",
-                      genres=None,
+    dataset = MtgMdct(split="train_0",
                       sampling_rate=sampling_rate,
                       size=size
                       )
 
-    a1 = train_ds[0]
-    a2 = valid_ds[0]
-    print(a1["mdct"].shape)
-    print("DONE")
+    print("Loaded {} sections".format(len(dataset.sections)))
