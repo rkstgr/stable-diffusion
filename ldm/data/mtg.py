@@ -127,11 +127,6 @@ class MTGFullAudio(MTGBase):
     """
 
     def load_audio(self, audio_path):
-        if getattr(self, "print_audio_metadata", True):
-            metadata = torchaudio.info(audio_path)
-            print(metadata)
-            self.print_audio_metadata = False
-
         waveform, sr = torchaudio.load(audio_path)
 
         # resample if necessary
@@ -275,7 +270,8 @@ class MtgMdct(Dataset):
             section_mdct = track_mdct[section_nr]
 
         return {
-            **section,
+            "track_id": track_id,
+            "section_nr": section_nr,
             "mdct": section_mdct
         }
 
