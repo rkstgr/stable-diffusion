@@ -56,15 +56,15 @@ class ProgressBar:
     progress_actor: ActorHandle
     total: int
     description: str
-    min_interval = 2  # seconds
 
-    def __init__(self, total: int, description: str = ""):
+    def __init__(self, total: int, description: str = "", min_interval=1):
         # Ray actors don't seem to play nice with mypy, generating
         # a spurious warning for the following line,
         # which we need to suppress. The code is fine.
         self.progress_actor = ProgressBarActor.remote()  # type: ignore
         self.total = total
         self.description = description
+        self.min_interval = min_interval
 
     @property
     def actor(self) -> ActorHandle:

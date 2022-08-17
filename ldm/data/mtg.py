@@ -80,7 +80,7 @@ class MTGBase(Dataset):
         total_duration = sum([t["durationInSec"] for t in self.tracks.values()])
         print(f"Total duration: {total_duration:.1f}s, {total_duration / 3600:.1f}h, {total_duration / 3600 / 24:.1f}d")
 
-        # check that all audio tracks are present
+        print("Checking that all audio tracks are present")
         for track_id in self.track_ids:
             audio_path = self.get_audio_path(track_id)
             if not audio_path.exists():
@@ -167,7 +167,7 @@ def get_number_sections(track_path: Path, sampling_rate: int, size: int, step: i
 
 
 def aggregate_sections(dataset: MTGBase, size: int, step: int) -> List[Section]:
-    pb = ProgressBar(total=len(dataset), description="Aggregating sections")
+    pb = ProgressBar(total=len(dataset), description="Aggregating sections", min_interval=5)
     actor = pb.actor
 
     track_sections_refs = [
@@ -183,7 +183,7 @@ def aggregate_sections(dataset: MTGBase, size: int, step: int) -> List[Section]:
     track_sections = ray.get(track_sections_refs)
 
     sections = []
-    for j, track_id, n_sections in zip(range(len(dataset.track_ids)), dataset.track_ids, track_sections):
+    for track_id, n_sections in zip(dataset.track_ids, track_sections):
         track_info = dataset.tracks[track_id]
         for i in range(n_sections):
             sections.append(Section(track_id=track_id, section_nr=i, **track_info))
@@ -205,11 +205,12 @@ class MtgMdct(Dataset):
         self.mtg_base = MTGFullAudio(split=split, sampling_rate=sampling_rate, **kwargs)
 
         try:
-            self.sections: List[Section] = aggregate_sections(self.mtg_base, self.size, self.step)
+            self.sections = self.load_sections()
         except FileNotFoundError:
+            self.sections: List[Section] = aggregate_sections(self.mtg_base, self.size, self.step)
             self.save_sections(self.sections)
 
-        print(f"Loaded {len(self.sections)} sections")
+        print(f"Dataset contains {len(self.sections)} sections")
 
     def sections_path(self) -> Path:
         return self.mtg_base.data_root / "sections" / self.split / f"{self.size}-{self.sampling_rate}.feather"
@@ -217,6 +218,7 @@ class MtgMdct(Dataset):
     def load_sections(self) -> List[Section]:
         path = self.sections_path()
         if path.exists():
+            print(f"Loading sections from {path}")
             df = pd.read_feather(path)
             return df.to_dict("records")
         else:
@@ -226,6 +228,7 @@ class MtgMdct(Dataset):
         path = self.sections_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         df = pd.DataFrame(sections)
+        print(f"Saving sections to {path}")
         df.to_feather(path)
 
     def get_mdct_path(self, track_id: int) -> Path:
@@ -283,7 +286,7 @@ if __name__ == "__main__":
     test_sampling_rate = 22050
     test_size = 256
 
-    dataset = MtgMdct(split="train_0",
+    dataset = MtgMdct(split="valid",
                       # genres=["classical"],
                       sampling_rate=test_sampling_rate,
                       size=test_size
