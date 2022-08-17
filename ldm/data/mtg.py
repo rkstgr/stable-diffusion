@@ -1,3 +1,4 @@
+from functools import total_ordering
 import math
 import os
 from pathlib import Path
@@ -69,12 +70,14 @@ class MTGBase(Dataset):
 
         self.tracks: Dict[TrackId, TrackInfo] = _load_track_info(tsv_file)
         if not filter_predicate and genres:
+            print("Filtering on genres: {}".format(genres))
             filter_predicate = lambda t: any([genre in t["genres"] for genre in genres])
         if filter_predicate:
             self.tracks = {k: v for k, v in self.tracks.items() if filter_predicate(v)}
         self.track_ids = list(self.tracks.keys())
         print("Loaded {} tracks from {}".format(len(self.tracks), tsv_file))
-        print("Total duration: {:.1f}".format(sum([t["durationInSec"] for t in self.tracks.values()])))
+        total_duration = sum([t["durationInSec"] for t in self.tracks.values()])
+        print(f"Total duration: {total_duration:.1f}s, {total_duration/3600:.1f}h, {total_duration/3600/24:.1f}d")
 
         # check that all audio tracks are present
         for track_id in self.track_ids:
@@ -148,6 +151,7 @@ def mdct_length(audio_length, n_fft=512) -> int:
 def aggregate_sections(dataset: MTGBase, size: int, step: int) -> List[Section]:
     sections = []
     last_print = time()
+    start_time = time()
     for j, (track_id, track_info) in enumerate(dataset.tracks.items()):
         audio_length = dataset.get_audio_length(track_id)
         audio_mdct_length = mdct_length(audio_length, n_fft=int(size * 2))
@@ -155,8 +159,9 @@ def aggregate_sections(dataset: MTGBase, size: int, step: int) -> List[Section]:
         for i in range(n_sections):
             sections.append(Section(track_id=track_id, section_nr=i, **track_info))
         if time() - last_print > 2:
+            eta_in_sec = (time() - start_time) / (j + 1) * (len(dataset) - j - 1) 
             print(
-                f"Aggregating sections {j}/{len(dataset.tracks)} (ETA {(time() - last_print) / j * (len(dataset.tracks) - j):.1f}s)")
+                f"Aggregating sections {j}/{len(dataset.tracks)} (ETA {eta_in_sec:.1f}s)")
             last_print = time()
     return sections
 
@@ -253,7 +258,8 @@ if __name__ == "__main__":
     sampling_rate = 22050
     size = 256
 
-    dataset = MtgMdct(split="train_0",
+    dataset = MtgMdct(split="train",
+                      genres=["classical"],
                       sampling_rate=sampling_rate,
                       size=size
                       )
