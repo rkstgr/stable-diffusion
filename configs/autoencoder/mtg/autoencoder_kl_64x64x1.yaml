@@ -2,8 +2,9 @@ model:
   base_learning_rate: 1e-4
   target: ldm.models.autoencoder.AutoencoderKL
   params:
-    monitor: "val/rec_loss"
+    monitor: "val/total_loss"
     embed_dim: 1
+    image_key: "mdct"
     lossconfig:
       target: ldm.modules.losses.mdct.MdctLoss
       params:
@@ -25,20 +26,18 @@ model:
 data:
   target: main.DataModuleFromConfig
   params:
-    batch_size: 16
+    batch_size: 2
     wrap: True
     train:
       target: ldm.data.mtg.MtgMdct
       params:
-        split: train
+        split: train_0
         size: 256
-        genres: ['classical']
         sampling_rate: 22050
     validation:
       target: ldm.data.mtg.MtgMdct
       params:
-        split: valid
-        genres: ['classical']
+        split: valid_0
         size: 256
         sampling_rate: 22050
 
