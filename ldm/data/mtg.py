@@ -1,17 +1,17 @@
 import math
-import multiprocessing as mp
 import os
-from functools import partial
 from pathlib import Path
 from typing import Callable, TypedDict, List, Dict
 
 import pandas as pd
+import ray
 import torch
 import torchaudio
 from einops import rearrange
 from mdct import mdct
-from mpire import WorkerPool
 from torch.utils.data import Dataset
+
+from ldm.data.ray_util import ProgressBar
 
 TrackId = int
 
@@ -157,21 +157,30 @@ def get_audio_length(audio_path, sampling_rate: int) -> int:
     return int(frames)
 
 
-def get_number_sections(track_path: Path, sampling_rate: int, size: int, step: int) -> int:
+@ray.remote
+def get_number_sections(track_path: Path, sampling_rate: int, size: int, step: int, pba) -> int:
     audio_length = get_audio_length(track_path, sampling_rate)
     audio_mdct_length = mdct_length(audio_length, n_fft=int(size * 2))
     n_sections = int((audio_mdct_length - size) / step + 1)
+    pba.update.remote(1)
     return n_sections
 
 
 def aggregate_sections(dataset: MTGBase, size: int, step: int) -> List[Section]:
-    number_of_cores = os.environ.get('SLURM_CPUS_PER_TASK', mp.cpu_count())
-    print(f"Found {number_of_cores} cpus")
+    pb = ProgressBar(total=len(dataset), description="Aggregating sections")
+    actor = pb.actor
 
-    func_number_sections = partial(get_number_sections, sampling_rate=dataset.sampling_rate, size=size, step=step)
-    with WorkerPool(n_jobs=number_of_cores) as pool:
-        track_paths = [dataset.get_audio_path(track_id) for track_id in dataset.track_ids]
-        track_sections = pool.map(func_number_sections, track_paths, progress_bar=True)
+    track_sections_refs = [
+        get_number_sections.remote(
+            dataset.get_audio_path(track_id),
+            dataset.sampling_rate,
+            size,
+            step,
+            actor
+        )
+        for track_id in dataset.track_ids]
+    pb.print_until_done()
+    track_sections = ray.get(track_sections_refs)
 
     sections = []
     for j, track_id, n_sections in zip(range(len(dataset.track_ids)), dataset.track_ids, track_sections):
@@ -270,6 +279,7 @@ class MtgMdct(Dataset):
 
 # main
 if __name__ == "__main__":
+    ray.init()
     test_sampling_rate = 22050
     test_size = 256
 
