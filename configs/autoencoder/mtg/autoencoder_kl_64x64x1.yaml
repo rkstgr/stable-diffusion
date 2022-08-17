@@ -32,11 +32,13 @@ data:
       params:
         split: train
         size: 256
+        genres: ['classical']
         sampling_rate: 22050
     validation:
       target: ldm.data.mtg.MtgMdct
       params:
         split: valid
+        genres: ['classical']
         size: 256
         sampling_rate: 22050
 

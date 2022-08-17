@@ -1,8 +1,7 @@
-from audioop import mul
+import math
 import multiprocessing
 import os
 import time
-import warnings
 from pathlib import Path
 from typing import Callable, TypedDict, List, Dict
 
@@ -10,10 +9,8 @@ import pandas as pd
 import torch
 import torchaudio
 from einops import rearrange
-from mdct import mdct, imdct
-from parallelbar import progress_map
-from torch.utils.data import Dataset, IterableDataset
-from tqdm import tqdm
+from mdct import mdct
+from torch.utils.data import Dataset
 
 TrackId = int
 
@@ -52,6 +49,7 @@ class MTGBase(Dataset):
                  tsv_file=None,
                  data_root=None,
                  filter_predicate: Callable[[TrackInfo], bool] = None,
+                 genres: List[str] = None,
                  file_type=".opus",
                  sampling_rate=48000,
                  ):
@@ -61,6 +59,8 @@ class MTGBase(Dataset):
         self.sampling_rate = sampling_rate
 
         self.tracks: Dict[TrackId, TrackInfo] = _load_track_info(tsv_file)
+        if not filter_predicate and genres:
+            filter_predicate = lambda t: any([genre in t["genres"] for genre in genres])
         if filter_predicate:
             self.tracks = {k: v for k,v in self.tracks.items() if filter_predicate(v)}
         self.track_ids = list(self.tracks.keys())
@@ -190,13 +190,13 @@ class MtgMdct(Dataset):
             mdct_repr_unfolded = rearrange(mdct_repr.unfold(1, self.size, self.size), "f u t -> u f t")
             last_status_time = time.time()
             for sample_id, sample_tensor in enumerate(mdct_repr_unfolded):
-                self.save_mdct(track_id, sample_id, sample_tensor.clone())
+                self.save_mdct(track_id, sample_id, sample_tensor.float().clone())
                 sample = {
                     "track_id": track_id,
                     **track_info,
                     "sample_id": sample_id
                 }
-                if (time.time() - last_status_time) > 5:
+                if (time.time() - last_status_time) > 15:
                     print(f"[{process.name}] Processing track {track_id:>7}: {sample_id:>3}/{mdct_repr_unfolded.shape[0]:>3}")
                     last_status_time = time.time()
                 track_samples.append(sample)
@@ -211,12 +211,15 @@ class MtgMdct(Dataset):
         samples = []
         start = time.time()
         last_status_time = start
-        with multiprocessing.Pool(number_of_cores) as pool:
-            for i, sample in enumerate(pool.imap_unordered(self.preprocess_track, self.mtg_base.track_ids)):
-                samples.extend(sample)
-                if (time.time() - last_status_time) > 5:
-                    print(f"MDCT preprocessing: {i}/{len(self.mtg_base.track_ids)} (ETA: {(time.time() - start) / (i + 1) * (len(self.mtg_base.track_ids) - i - 1):.1f}s)")
-                    last_status_time = time.time()
+        try:
+            with multiprocessing.Pool(number_of_cores) as pool:
+                for i, sample in enumerate(pool.imap_unordered(self.preprocess_track, self.mtg_base.track_ids)):
+                    samples.extend(sample)
+                    if (time.time() - last_status_time) > 5:
+                        print(f"MDCT preprocessing: {i}/{len(self.mtg_base.track_ids)} (ETA: {(time.time() - start) / (i + 1) * (len(self.mtg_base.track_ids) - i - 1):.1f}s)")
+                        last_status_time = time.time()
+        finally:
+            print("Len samples", len(samples))
         print(f"Finished MDCT preprocessing in {time.time() - start:.1f}s")
         return samples
 
@@ -228,8 +231,12 @@ class MtgMdct(Dataset):
         mdct = self.load_mdct(sample["track_id"], sample["sample_id"])
         return {
             **sample,
-            "mdct": mdct
+            "mdct": mdct.float()
         }
+
+
+def mdct_length(wavelength, framelength=512):
+    return math.ceil(wavelength/framelength)*framelength/(framelength//2) + 1
 
 
 # main
@@ -237,11 +244,18 @@ if __name__ == "__main__":
     sampling_rate = 22050
     size = 256
 
-    dataset = MtgMdct(split="train",
-                      filter_predicate=lambda t: "emocore" in t["genres"],
+    train_ds = MtgMdct(split="train",
+                      genres=None,
                       sampling_rate=sampling_rate,
                       size=size
                       )
-    a1 = dataset[0]
+    valid_ds = MtgMdct(split="valid",
+                      genres=None,
+                      sampling_rate=sampling_rate,
+                      size=size
+                      )
+
+    a1 = train_ds[0]
+    a2 = valid_ds[0]
     print(a1["mdct"].shape)
     print("DONE")
