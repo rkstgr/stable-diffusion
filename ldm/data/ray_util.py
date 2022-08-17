@@ -85,8 +85,9 @@ class ProgressBar:
         start_time = last_update
         while True:
             delta, counter = ray.get(self.actor.wait_for_update.remote())
-            if time() - last_update > self.min_interval:
+            if (time() - last_update) > self.min_interval:
                 eta = (time() - start_time) / counter * (self.total - counter)
                 print(f"{self.description}: {counter}/{self.total} (ETA {eta:.1f}s)")
+                last_update = time()
             if counter >= self.total:
                 return
