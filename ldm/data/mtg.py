@@ -269,7 +269,7 @@ class MtgMdct(Dataset):
 
         try:
             section_mdct = self.load_mdct(track_id, section_nr)
-        except FileNotFoundError:
+        except (FileNotFoundError, EOFError):
             track_mdct = self.generate_track_mdct(track_id)
             self.save_mdct(track_id, track_mdct)
             section_mdct = track_mdct[section_nr]
