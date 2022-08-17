@@ -1,8 +1,8 @@
-from functools import total_ordering
 import math
+import multiprocessing as mp
 import os
+from functools import partial
 from pathlib import Path
-from time import time
 from typing import Callable, TypedDict, List, Dict
 
 import pandas as pd
@@ -10,6 +10,7 @@ import torch
 import torchaudio
 from einops import rearrange
 from mdct import mdct
+from mpire import WorkerPool
 from torch.utils.data import Dataset
 
 TrackId = int
@@ -77,7 +78,7 @@ class MTGBase(Dataset):
         self.track_ids = list(self.tracks.keys())
         print("Loaded {} tracks from {}".format(len(self.tracks), tsv_file))
         total_duration = sum([t["durationInSec"] for t in self.tracks.values()])
-        print(f"Total duration: {total_duration:.1f}s, {total_duration/3600:.1f}h, {total_duration/3600/24:.1f}d")
+        print(f"Total duration: {total_duration:.1f}s, {total_duration / 3600:.1f}h, {total_duration / 3600 / 24:.1f}d")
 
         # check that all audio tracks are present
         for track_id in self.track_ids:
@@ -148,21 +149,35 @@ def mdct_length(audio_length, n_fft=512) -> int:
     return int(math.ceil(audio_length / n_fft) * n_fft / (n_fft // 2) + 1)
 
 
+def get_audio_length(audio_path, sampling_rate: int) -> int:
+    metadata = torchaudio.info(audio_path)
+    frames = metadata.num_frames
+    if metadata.sample_rate != sampling_rate:
+        frames = math.ceil(frames * sampling_rate / metadata.sample_rate)
+    return int(frames)
+
+
+def get_number_sections(track_path: Path, sampling_rate: int, size: int, step: int) -> int:
+    audio_length = get_audio_length(track_path, sampling_rate)
+    audio_mdct_length = mdct_length(audio_length, n_fft=int(size * 2))
+    n_sections = int((audio_mdct_length - size) / step + 1)
+    return n_sections
+
+
 def aggregate_sections(dataset: MTGBase, size: int, step: int) -> List[Section]:
+    number_of_cores = os.environ.get('SLURM_CPUS_PER_TASK', mp.cpu_count())
+    print(f"Found {number_of_cores} cpus")
+
+    func_number_sections = partial(get_number_sections, sampling_rate=dataset.sampling_rate, size=size, step=step)
+    with WorkerPool(n_jobs=number_of_cores) as pool:
+        track_paths = [dataset.get_audio_path(track_id) for track_id in dataset.track_ids]
+        track_sections = pool.map(func_number_sections, track_paths, progress_bar=True)
+
     sections = []
-    last_print = time()
-    start_time = time()
-    for j, (track_id, track_info) in enumerate(dataset.tracks.items()):
-        audio_length = dataset.get_audio_length(track_id)
-        audio_mdct_length = mdct_length(audio_length, n_fft=int(size * 2))
-        n_sections = int((audio_mdct_length - size) / step + 1)
+    for j, track_id, n_sections in zip(range(len(dataset.track_ids)), dataset.track_ids, track_sections):
+        track_info = dataset.tracks[track_id]
         for i in range(n_sections):
             sections.append(Section(track_id=track_id, section_nr=i, **track_info))
-        if time() - last_print > 2:
-            eta_in_sec = (time() - start_time) / (j + 1) * (len(dataset) - j - 1) 
-            print(
-                f"Aggregating sections {j}/{len(dataset.tracks)} (ETA {eta_in_sec:.1f}s)")
-            last_print = time()
     return sections
 
 
@@ -226,7 +241,7 @@ class MtgMdct(Dataset):
         Returns a list of tensor views of the mdcts for the given track_id.
         """
         audio = self.mtg_base.load_audio(self.mtg_base.get_audio_path(track_id))
-        audio_mdct = mdct(audio, framelength=self.size*2)
+        audio_mdct = mdct(audio, framelength=self.size * 2)
         audio_mdct = torch.from_numpy(audio_mdct).float()
         audio_mdcts = audio_mdct.unfold(1, self.size, self.size)
         audio_mdcts = rearrange(audio_mdcts, "f u t -> u f t")
@@ -255,13 +270,11 @@ class MtgMdct(Dataset):
 
 # main
 if __name__ == "__main__":
-    sampling_rate = 22050
-    size = 256
+    test_sampling_rate = 22050
+    test_size = 256
 
-    dataset = MtgMdct(split="train",
-                      genres=["classical"],
-                      sampling_rate=sampling_rate,
-                      size=size
+    dataset = MtgMdct(split="train_0",
+                      # genres=["classical"],
+                      sampling_rate=test_sampling_rate,
+                      size=test_size
                       )
-
-    print("Loaded {} sections".format(len(dataset.sections)))
