@@ -187,8 +187,9 @@ class MtgMdctIterable(IterableDataset):
         if not hasattr(self, "len_cached"):
             total_length = 0
             for track_id in self.mtg_base.track_ids:
-                audio_length = self.mtg_base.get_approx_audio_length(track_id)
-                n_sections = mdct_length(audio_length, self.size*2)
+                len_audio = self.mtg_base.get_approx_audio_length(track_id)
+                len_mdct = mdct_length(len_audio, self.size)
+                n_sections = int((len_mdct - self.size) / self.step + 1)
                 total_length += n_sections
             self.len_cached = total_length
         return self.len_cached
@@ -222,7 +223,7 @@ if __name__ == "__main__":
                             num_workers=0,
                             shuffle=True
                             )
-    
+
     print("dataloader length", len(dataloader))
 
     for i, batch in enumerate(dataloader):
