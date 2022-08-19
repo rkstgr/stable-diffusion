@@ -1,6 +1,7 @@
 import itertools
 import math
 import os
+import random
 from pathlib import Path
 from typing import Callable, TypedDict, List, Dict
 
@@ -158,12 +159,13 @@ def generate_mdct_sections(audio_wave: torch.Tensor, size, step):
 
 
 class MtgMdctIterable(IterableDataset):
-    def __init__(self, split: str, sampling_rate=22050, size=256, step=256, **kwargs):
+    def __init__(self, split: str, sampling_rate=22050, size=256, step=256, num_samples_per_track=None, **kwargs):
         super().__init__()
         self.split = split
         self.size = size
         self.step = step
         self.sampling_rate = sampling_rate
+        self.num_samples_per_track = num_samples_per_track
         self.mtg_base = MTGFullAudio(split=split, sampling_rate=sampling_rate, **kwargs)
 
     def __iter__(self):
@@ -172,14 +174,19 @@ class MtgMdctIterable(IterableDataset):
         if worker_info is not None:
             num_workers = worker_info.num_workers
             track_ids = track_ids[worker_info.id::num_workers]
+            torch_seed = torch.initial_seed()
+            random.seed((torch_seed + worker_info.id) % (2 ** 32 - 1))
         for track_id in track_ids:
             audio_repr = self.mtg_base.load_audio(self.mtg_base.get_audio_path(track_id))
             mdct_sections = generate_mdct_sections(audio_repr, self.size, self.step)
-            for i, mdct_view in enumerate(mdct_sections):
+            mdct_sections_ids = range(mdct_sections.shape[0])
+            if self.num_samples_per_track and self.num_samples_per_track < mdct_sections.shape[0]:
+                mdct_sections_ids = random.sample(mdct_sections_ids, self.num_samples_per_track)
+            for i in mdct_sections_ids:
                 yield {
                     "track_id": track_id,
                     "section_nr": i,
-                    "mdct": mdct_view
+                    "mdct": mdct_sections[i],
                 }
 
     def __len__(self):
@@ -190,6 +197,8 @@ class MtgMdctIterable(IterableDataset):
                 len_audio = self.mtg_base.get_approx_audio_length(track_id)
                 len_mdct = mdct_length(len_audio, self.size)
                 n_sections = int((len_mdct - self.size) / self.step + 1)
+                if self.num_samples_per_track:
+                    n_sections = min(n_sections, self.num_samples_per_track)
                 total_length += n_sections
             self.len_cached = total_length
         return self.len_cached
@@ -209,7 +218,8 @@ if __name__ == "__main__":
                               # genres=["classical"],
                               size=test_size,
                               step=test_size,
-                              sampling_rate=test_sampling_rate
+                              sampling_rate=test_sampling_rate,
+                              num_samples_per_track=2
                               )
 
     print("dataset length", len(dataset))
