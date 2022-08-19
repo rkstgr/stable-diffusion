@@ -214,7 +214,8 @@ class DataModuleFromConfig(pl.LightningDataModule):
             return DataLoader(shuffled_dataloader,
                               batch_size=self.batch_size,
                               num_workers=0,
-                              shuffle=True
+                              shuffle=True,
+                              pin_memory=True
                               )
         is_iterable_dataset = isinstance(self.datasets['train'], Txt2ImgIterableBaseDataset)
         if is_iterable_dataset or self.use_worker_init_fn:
@@ -241,7 +242,7 @@ class DataModuleFromConfig(pl.LightningDataModule):
             return DataLoader(shuffled_dataloader,
                               batch_size=self.batch_size,
                               num_workers=0,
-                              shuffle=True
+                              shuffle=False
                               )
         if isinstance(self.datasets['validation'], Txt2ImgIterableBaseDataset) or self.use_worker_init_fn:
             init_fn = worker_init_fn
