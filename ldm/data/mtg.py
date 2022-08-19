@@ -188,7 +188,7 @@ class MtgMdctIterable(IterableDataset):
             total_length = 0
             for track_id in self.mtg_base.track_ids:
                 audio_length = self.mtg_base.get_approx_audio_length(track_id)
-                n_sections = mdct_length(audio_length, self.size)
+                n_sections = mdct_length(audio_length, self.size*2)
                 total_length += n_sections
             self.len_cached = total_length
         return self.len_cached
@@ -204,12 +204,14 @@ if __name__ == "__main__":
     test_size = 256
     batch_size = 4
 
-    dataset = MtgMdctIterable(split="train_0",
+    dataset = MtgMdctIterable(split="train_dev",
                               # genres=["classical"],
                               size=test_size,
                               step=test_size,
                               sampling_rate=test_sampling_rate
                               )
+
+    print("dataset length", len(dataset))
 
     # dataset = dp.iter.IterableWrapper(dataset).shuffle(buffer_size=batch_size * 10)
 
@@ -220,6 +222,8 @@ if __name__ == "__main__":
                             num_workers=0,
                             shuffle=True
                             )
+    
+    print("dataloader length", len(dataloader))
 
     for i, batch in enumerate(dataloader):
         print(list(zip(batch["track_id"].numpy(), batch["section_nr"].numpy())), end="\t")
