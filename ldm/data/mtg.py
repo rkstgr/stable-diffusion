@@ -223,6 +223,7 @@ if __name__ == "__main__":
                               )
 
     print("dataset length", len(dataset))
+    print("n tracks", len(dataset.mtg_base.track_ids))
 
     # dataset = dp.iter.IterableWrapper(dataset).shuffle(buffer_size=batch_size * 10)
 
