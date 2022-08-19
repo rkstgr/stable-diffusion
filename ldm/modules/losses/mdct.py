@@ -8,7 +8,7 @@ class MdctLoss(nn.Module):
         self.kl_weight = kl_weight
         self.logvar = nn.Parameter(torch.ones(size=()) * logvar_init)
 
-    def forward(self, inputs, reconstructions, posteriors, *args, **kwargs):
+    def forward(self, inputs, reconstructions, posteriors, optimizer_idx=None, *args, **kwargs):
         rec_loss = torch.abs(inputs.contiguous() - reconstructions.contiguous())
         nll_loss = rec_loss / torch.exp(self.logvar) + self.logvar
         nll_loss = torch.sum(nll_loss) / nll_loss.shape[0]
