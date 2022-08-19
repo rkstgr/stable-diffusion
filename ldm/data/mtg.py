@@ -91,6 +91,9 @@ class MTGBase(Dataset):
     def get_audio_path(self, track_id: TrackId) -> Path:
         return Path(self.data_root) / "opus" / f"{track_id}{self.file_type}"
 
+    def get_approx_audio_length(self, track_id: TrackId) -> int:
+        return int(self.sampling_rate * self.tracks[track_id]["durationInSec"])
+
     def get_audio_length(self, track_id: TrackId) -> int:
         metadata = torchaudio.info(self.get_audio_path(track_id))
         frames = metadata.num_frames
@@ -178,6 +181,17 @@ class MtgMdctIterable(IterableDataset):
                     "section_nr": i,
                     "mdct": mdct_view
                 }
+
+    def __len__(self):
+        print("Returning approximate length")
+        if not hasattr(self, "len_cached"):
+            total_length = 0
+            for track_id in self.mtg_base.track_ids:
+                audio_length = self.mtg_base.get_approx_audio_length(track_id)
+                n_sections = mdct_length(audio_length, self.size)
+                total_length += n_sections
+            self.len_cached = total_length
+        return self.len_cached
 
 
 def collate_unbatch(x):
