@@ -1,17 +1,16 @@
+import itertools
 import math
 import os
 from pathlib import Path
 from typing import Callable, TypedDict, List, Dict
 
 import pandas as pd
-import ray
 import torch
 import torchaudio
 from einops import rearrange
 from mdct import mdct
-from torch.utils.data import Dataset
-
-from ldm.data.ray_util import ProgressBar
+from torch.utils.data import Dataset, IterableDataset, DataLoader, default_collate
+from torch.utils.data.datapipes.iter.combinatorics import ShufflerIterDataPipe
 
 TrackId = int
 
@@ -144,146 +143,72 @@ def mdct_length(audio_length, n_fft=512) -> int:
     return int(math.ceil(audio_length / n_fft) * n_fft / (n_fft // 2) + 1)
 
 
-def get_audio_length(audio_path, sampling_rate: int) -> int:
-    metadata = torchaudio.info(audio_path)
-    frames = metadata.num_frames
-    if metadata.sample_rate != sampling_rate:
-        frames = math.ceil(frames * sampling_rate / metadata.sample_rate)
-    return int(frames)
+def generate_mdct_sections(audio_wave: torch.Tensor, size, step):
+    """
+    Returns a tensor with (n_sections, n_fft, n_frames)
+    """
+    audio_mdct = mdct(audio_wave, framelength=size * 2)
+    audio_mdct = torch.from_numpy(audio_mdct).float()
+    audio_mdcts = audio_mdct.unfold(1, size, step)
+    audio_mdcts = rearrange(audio_mdcts, "f b t -> b f t")
+    return audio_mdcts
 
 
-@ray.remote
-def get_number_sections(track_path: Path, sampling_rate: int, size: int, step: int, pba) -> int:
-    audio_length = get_audio_length(track_path, sampling_rate)
-    audio_mdct_length = mdct_length(audio_length, n_fft=int(size * 2))
-    n_sections = int((audio_mdct_length - size) / step + 1)
-    pba.update.remote(1)
-    return n_sections
-
-
-def aggregate_sections(dataset: MTGBase, size: int, step: int) -> List[Section]:
-    pb = ProgressBar(total=len(dataset), description="Aggregating sections", min_interval=5)
-    actor = pb.actor
-
-    track_sections_refs = [
-        get_number_sections.remote(
-            dataset.get_audio_path(track_id),
-            dataset.sampling_rate,
-            size,
-            step,
-            actor
-        )
-        for track_id in dataset.track_ids]
-    pb.print_until_done()
-    track_sections = ray.get(track_sections_refs)
-
-    sections = []
-    for track_id, n_sections in zip(dataset.track_ids, track_sections):
-        track_info = dataset.tracks[track_id]
-        for i in range(n_sections):
-            sections.append(Section(track_id=track_id, section_nr=i, **track_info))
-    return sections
-
-
-class MtgMdct(Dataset):
-    def __init__(self,
-                 split: str,
-                 sampling_rate=22050,
-                 size=256,
-                 **kwargs
-                 ):
-        super(MtgMdct).__init__()
+class MtgMdctIterable(IterableDataset):
+    def __init__(self, split: str, sampling_rate=22050, size=256, step=256, **kwargs):
+        super().__init__()
         self.split = split
         self.size = size
-        self.step = size
+        self.step = step
         self.sampling_rate = sampling_rate
         self.mtg_base = MTGFullAudio(split=split, sampling_rate=sampling_rate, **kwargs)
 
-        try:
-            self.sections = self.load_sections()
-        except FileNotFoundError:
-            self.sections: List[Section] = aggregate_sections(self.mtg_base, self.size, self.step)
-            self.save_sections(self.sections)
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        track_ids = self.mtg_base.track_ids
+        if worker_info is not None:
+            num_workers = worker_info.num_workers
+            track_ids = track_ids[worker_info.id::num_workers]
+        for track_id in track_ids:
+            audio_repr = self.mtg_base.load_audio(self.mtg_base.get_audio_path(track_id))
+            mdct_sections = generate_mdct_sections(audio_repr, self.size, self.step)
+            for i, mdct_view in enumerate(mdct_sections):
+                yield {
+                    "track_id": track_id,
+                    "section_nr": i,
+                    "mdct": mdct_view
+                }
 
-        print(f"Dataset contains {len(self.sections)} sections")
 
-    def sections_path(self) -> Path:
-        return self.mtg_base.data_root / "sections" / self.split / f"{self.size}-{self.sampling_rate}.feather"
-
-    def load_sections(self) -> List[Section]:
-        path = self.sections_path()
-        if path.exists():
-            print(f"Loading sections from {path}")
-            df = pd.read_feather(path)
-            return df.to_dict("records")
-        else:
-            raise FileNotFoundError(f"{path} not found")
-
-    def save_sections(self, sections):
-        path = self.sections_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        df = pd.DataFrame(sections)
-        print(f"Saving sections to {path}")
-        df.to_feather(path)
-
-    def get_mdct_path(self, track_id: int) -> Path:
-        return Path(
-            self.mtg_base.data_root) / "mdct" / f"{self.size}-{self.sampling_rate}Hz" / f"{track_id}.pt"
-
-    def save_mdct(self, track_id, tensor):
-        mdct_path = self.get_mdct_path(track_id)
-        mdct_path.parent.mkdir(parents=True, exist_ok=True)
-        with mdct_path.open("wb") as f:
-            torch.save(tensor, f)
-
-    def load_mdct(self, track_id, section_nr):
-        mdct_path = self.get_mdct_path(track_id)
-        if mdct_path.exists():
-            return torch.load(mdct_path)[section_nr].clone()
-        else:
-            raise FileNotFoundError(f"{mdct_path=} not found")
-
-    def generate_track_mdct(self, track_id):
-        """
-        Returns a list of tensor views of the mdcts for the given track_id.
-        """
-        audio = self.mtg_base.load_audio(self.mtg_base.get_audio_path(track_id))
-        audio_mdct = mdct(audio, framelength=self.size * 2)
-        audio_mdct = torch.from_numpy(audio_mdct).float()
-        audio_mdcts = audio_mdct.unfold(1, self.size, self.size)
-        audio_mdcts = rearrange(audio_mdcts, "f u t -> u f t")
-        return audio_mdcts
-
-    def __len__(self) -> int:
-        return len(self.sections)
-
-    def __getitem__(self, i):
-        section = self.sections[i]
-        track_id = section["track_id"]
-        section_nr = section["section_nr"]
-
-        try:
-            section_mdct = self.load_mdct(track_id, section_nr)
-        except (FileNotFoundError, EOFError):
-            track_mdct = self.generate_track_mdct(track_id)
-            self.save_mdct(track_id, track_mdct)
-            section_mdct = track_mdct[section_nr]
-
-        return {
-            "track_id": track_id,
-            "section_nr": section_nr,
-            "mdct": section_mdct
-        }
+def collate_unbatch(x):
+    return {k: v[0] for k, v in default_collate(x).items()}
 
 
 # main
 if __name__ == "__main__":
-    ray.init()
     test_sampling_rate = 22050
     test_size = 256
+    batch_size = 4
 
-    dataset = MtgMdct(split="valid",
-                      # genres=["classical"],
-                      sampling_rate=test_sampling_rate,
-                      size=test_size
-                      )
+    dataset = MtgMdctIterable(split="train_0",
+                              # genres=["classical"],
+                              size=test_size,
+                              step=test_size,
+                              sampling_rate=test_sampling_rate
+                              )
+
+    # dataset = dp.iter.IterableWrapper(dataset).shuffle(buffer_size=batch_size * 10)
+
+    dataloader = DataLoader(dataset, batch_size=1, num_workers=8, collate_fn=collate_unbatch, prefetch_factor=1)
+    shuffled = ShufflerIterDataPipe(dataloader, buffer_size=100)
+    dataloader = DataLoader(shuffled,
+                            batch_size=batch_size,
+                            num_workers=0,
+                            shuffle=True
+                            )
+
+    for i, batch in enumerate(dataloader):
+        print(list(zip(batch["track_id"].numpy(), batch["section_nr"].numpy())), end="\t")
+        print(batch["mdct"].shape)
+        if i > 5:
+            break

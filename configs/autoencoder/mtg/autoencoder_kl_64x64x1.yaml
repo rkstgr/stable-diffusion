@@ -27,18 +27,20 @@ data:
   target: main.DataModuleFromConfig
   params:
     batch_size: 2
-    wrap: True
+    buffer_size: 2000
     train:
-      target: ldm.data.mtg.MtgMdct
+      target: ldm.data.mtg.MtgMdctIterable
       params:
         split: train_0
         size: 256
+        step: 256
         sampling_rate: 22050
     validation:
-      target: ldm.data.mtg.MtgMdct
+      target: ldm.data.mtg.MtgMdctIterable
       params:
         split: valid_0
         size: 256
+        step: 256
         sampling_rate: 22050
 
 lightning:

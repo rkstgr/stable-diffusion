@@ -16,8 +16,10 @@ from pytorch_lightning.trainer import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint, Callback, LearningRateMonitor
 from pytorch_lightning.utilities.distributed import rank_zero_only
 from pytorch_lightning.utilities import rank_zero_info
+from torch.utils.data.datapipes.iter.combinatorics import ShufflerIterDataPipe
 
 from ldm.data.base import Txt2ImgIterableBaseDataset
+from ldm.data.mtg import MtgMdctIterable, collate_unbatch
 from ldm.util import instantiate_from_config
 
 
@@ -162,12 +164,13 @@ def worker_init_fn(_):
 class DataModuleFromConfig(pl.LightningDataModule):
     def __init__(self, batch_size, train=None, validation=None, test=None, predict=None,
                  wrap=False, num_workers=None, shuffle_test_loader=False, use_worker_init_fn=False,
-                 shuffle_val_dataloader=False):
+                 shuffle_val_dataloader=False, **kwargs):
         super().__init__()
         self.batch_size = batch_size
         self.dataset_configs = dict()
         self.num_workers = num_workers if num_workers is not None else batch_size * 2
         self.use_worker_init_fn = use_worker_init_fn
+        self.kwargs = kwargs
         if train is not None:
             self.dataset_configs["train"] = train
             self.train_dataloader = self._train_dataloader
@@ -195,6 +198,24 @@ class DataModuleFromConfig(pl.LightningDataModule):
                 self.datasets[k] = WrappedDataset(self.datasets[k])
 
     def _train_dataloader(self):
+        if isinstance(self.datasets["train"], MtgMdctIterable):
+            print("Using custom MtgMdctIterable dataloader pipeline (train)")
+            staged_dataloader = DataLoader(self.datasets["train"],
+                                           batch_size=1,
+                                           num_workers=self.num_workers,
+                                           collate_fn=collate_unbatch,
+                                           prefetch_factor=1
+                                           )
+            buffer_size = self.kwargs.get("buffer_size", self.batch_size * 10)
+            print("Shuffle buffer size:", buffer_size)
+            shuffled_dataloader = ShufflerIterDataPipe(staged_dataloader,
+                                                       buffer_size=buffer_size
+                                                       )
+            return DataLoader(shuffled_dataloader,
+                              batch_size=self.batch_size,
+                              num_workers=0,
+                              shuffle=True
+                              )
         is_iterable_dataset = isinstance(self.datasets['train'], Txt2ImgIterableBaseDataset)
         if is_iterable_dataset or self.use_worker_init_fn:
             init_fn = worker_init_fn
@@ -205,6 +226,23 @@ class DataModuleFromConfig(pl.LightningDataModule):
                           worker_init_fn=init_fn)
 
     def _val_dataloader(self, shuffle=False):
+        if isinstance(self.datasets["validation"], MtgMdctIterable):
+            print("Using custom MtgMdctIterable dataloader pipeline (validation)")
+            staged_dataloader = DataLoader(self.datasets["validation"],
+                                           batch_size=1,
+                                           num_workers=self.num_workers,
+                                           collate_fn=collate_unbatch,
+                                           prefetch_factor=1
+                                           )
+            buffer_size = self.kwargs.get("buffer_size", self.batch_size * 10)
+            shuffled_dataloader = ShufflerIterDataPipe(staged_dataloader,
+                                                       buffer_size=buffer_size
+                                                       )
+            return DataLoader(shuffled_dataloader,
+                              batch_size=self.batch_size,
+                              num_workers=0,
+                              shuffle=True
+                              )
         if isinstance(self.datasets['validation'], Txt2ImgIterableBaseDataset) or self.use_worker_init_fn:
             init_fn = worker_init_fn
         else:
@@ -583,7 +621,7 @@ if __name__ == "__main__":
         if "modelcheckpoint" in lightning_config:
             modelckpt_cfg = lightning_config.modelcheckpoint
         else:
-            modelckpt_cfg =  OmegaConf.create()
+            modelckpt_cfg = OmegaConf.create()
         modelckpt_cfg = OmegaConf.merge(default_modelckpt_cfg, modelckpt_cfg)
         print(f"Merged modelckpt-cfg: \n{modelckpt_cfg}")
         if version.parse(pl.__version__) < version.parse('1.4.0'):
